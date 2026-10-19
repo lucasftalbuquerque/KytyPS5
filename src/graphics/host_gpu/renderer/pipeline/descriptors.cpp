@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -50,6 +51,21 @@ namespace Libs::Graphics {
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
+
+// Scalar resource reads are materialized from guest memory before the draw/dispatch, so a
+// shader buffer write that overlaps them only matters for later waves of the *same* call
+// re-reading the bytes, which is unordered on real hardware as well. The next draw re-reads
+// memory, so keep running and report the overlap instead of aborting the emulator.
+void WarnScalarReadBufferWriteOverlap(uint64_t read_address, uint64_t read_size,
+                                      uint64_t write_address, uint64_t write_size) {
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("Warning: scalar resource reads [0x%016" PRIx64 ", +0x%" PRIx64
+		     ") overlap a shader buffer write [0x%016" PRIx64 ", +0x%" PRIx64
+		     "); using values captured before the call\n",
+		     read_address, read_size, write_address, write_size);
+	}
+}
 
 } // namespace
 
@@ -759,7 +775,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
 							} else if (address - read_address < read_size) {
-								EXIT("scalar resource reads overlap a shader buffer write\n");
+								WarnScalarReadBufferWriteOverlap(read_address, read_size, address,
+								                                 size);
 							}
 						}
 					}
@@ -958,7 +975,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+						WarnScalarReadBufferWriteOverlap(address, size, written.address,
+						                                 written.size);
 					}
 				}
 			}
